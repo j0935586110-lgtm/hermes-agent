@@ -89,37 +89,6 @@ def validate_runtime_override(overrides: Any) -> dict[str, str]:
     return valid
 
 
-def _override_model_acceptable(agent: Any, model: str) -> bool:
-    """Is ``model`` acceptable for the agent's active provider?
-
-    Uses the same validator the ``/model`` switch uses (custom endpoints report
-    ``recognized=False`` but stay acceptable).  Anything we cannot determine -- an
-    offline catalog, a validator that raises, a provider that needs credentials it
-    does not have -- is treated as acceptable so a legitimate self-hosted model is
-    never rejected by a hook.
-    """
-    try:
-        from hermes_cli.models_validate import validate_requested_model
-
-        verdict = validate_requested_model(
-            model,
-            getattr(agent, "provider", None),
-            api_key=getattr(agent, "api_key", None),
-            base_url=getattr(agent, "base_url", None),
-            api_mode=getattr(agent, "api_mode", None),
-        )
-    except Exception:  # health: allow BLE001 -- an unusable validator must not break the turn
-        logger.debug(
-            "runtime_override: model validation unavailable for %r; keeping the override",
-            model,
-            exc_info=True,
-        )
-        return True
-    if isinstance(verdict, dict):
-        return bool(verdict.get("accepted", True))
-    return True
-
-
 def _refresh_derived_route_state(agent: Any, overrides: dict[str, str]) -> None:
     """Refresh provider-derived state for the overridden route.
 
@@ -384,20 +353,6 @@ class _RuntimeOverrideScope:
         # No-op override (the route already is what the plugin asked for): projecting and
         # invalidating the cached system prompt here would break the byte-stability
         # invariant for no benefit, and the turn needs neither rollback nor a marker.
-        requested_model = ov.get("model")
-        if requested_model and requested_model != getattr(agent, "model", None):
-            if not _override_model_acceptable(agent, requested_model):
-                logger.warning(
-                    "runtime_override: model %r is not recognized for provider %r; the "
-                    "override is dropped and the session route stands for this turn",
-                    requested_model,
-                    getattr(agent, "provider", None),
-                )
-                ov.pop("model", None)
-                if not ov:
-                    self._no_op = True
-                    return self
-
         if ov and all(
             getattr(agent, name, self._MISSING) == value for name, value in ov.items()
         ):
@@ -524,13 +479,7 @@ class _RuntimeOverrideScope:
         if not self._turn_route_task_set:
             return
         self._turn_route_task_set = False
-        try:
-            setattr(self.agent, "_turn_route_task", self._turn_route_task_snapshot or "")
-        except Exception:  # health: allow BLE001 -- restore must not mask the turn's outcome
-            self._restore_failed = True
-            logger.warning(
-                "runtime_override: could not restore _turn_route_task", exc_info=True
-            )
+        self.agent._turn_route_task = self._turn_route_task_snapshot or ""
 
     def _abort(self) -> None:
         """Recover the in-memory route after a failed model projection.
