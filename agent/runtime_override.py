@@ -640,9 +640,11 @@ class _RuntimeOverrideScope:
             # an object the fallback no longer uses.  Token accounting is unaffected --
             # `turn_usage.record_response_usage` records the turn independently.
             # Forwarded on EVERY exit path, including the fallback handoff: the
-            # independent boundary contract (Spark) asserts the turn's real tokens reach
-            # the session compressor after a supersede.  Whether the handoff has already
-            # swapped that compressor is still an open review question (Claude).
+            # independent boundary contract asserts the turn's real tokens reach the
+            # session compressor after a supersede.  It is the same object -- only
+            # agent_init (session creation) and this scope assign
+            # `agent.context_compressor`, so a fallback swap cannot orphan the target
+            # (review question raised by Claude, refuted against the source).
             self._forward_compressor_progress()
             # Unregister on every exit path (normal restore AND superseded
             # skip), and only when this scope holds the registration.
