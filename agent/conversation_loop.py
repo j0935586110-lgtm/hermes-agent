@@ -1529,6 +1529,13 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
 def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
     """The codex app-server's result for this turn, or None when its failure activated a fallback and the
     generic loop retries the same user turn."""
+    from agent.runtime_override import warn_and_drop_unsupported_override
+
+    # This runtime accepts only its own models and can fall through into the normal loop,
+    # so one turn would cross the override scope boundary twice: refuse explicitly.
+    warn_and_drop_unsupported_override(
+        agent, "the codex_app_server runtime does not accept an override model"
+    )
     codex_result = agent._run_codex_app_server_turn(
         user_message=s.user_message, original_user_message=s.original_user_message,
         messages=s.messages, effective_task_id=s.effective_task_id,

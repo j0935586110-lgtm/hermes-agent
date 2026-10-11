@@ -89,6 +89,25 @@ def validate_runtime_override(overrides: Any) -> dict[str, str]:
     return valid
 
 
+def warn_and_drop_unsupported_override(agent: Any, reason: str) -> bool:
+    """The active runtime cannot honour a runtime_override: say so and drop it.
+
+    Returns True when an override was dropped.  Used for `codex_app_server`, where the
+    turn is handed to a long-lived subprocess that does not accept an arbitrary model
+    (and whose fallback can re-enter the normal loop); applying the override there would
+    either kill the subprocess or let one turn cross the scope boundary twice.  Dropping
+    it explicitly is better than silently ignoring it.
+    """
+    override = getattr(agent, "_runtime_override", None)
+    if not override:
+        return False
+    logger.warning(
+        "pre_llm_call runtime_override %r ignored: %s", override, reason
+    )
+    agent._runtime_override = {}
+    return True
+
+
 def _refresh_derived_route_state(agent: Any, overrides: dict[str, str]) -> None:
     """Refresh provider-derived state for the overridden route.
 
@@ -615,8 +634,15 @@ class _RuntimeOverrideScope:
             # fallback: a leaked marker would mis-attribute every later turn.
             self._restore_turn_route_task()
             # Real usage / compaction progress is turn progress, not model configuration:
-            # hand it back before the scoped copy is dropped (every exit path, including
-            # the fallback handoff -- usage is not route state).
+            # hand it back before the scoped copy is dropped.  NOT on the superseded path:
+            # a fallback handoff owns the route (and its compressor) from then on, so
+            # writing this copy's counters into the pre-override compressor would target
+            # an object the fallback no longer uses.  Token accounting is unaffected --
+            # `turn_usage.record_response_usage` records the turn independently.
+            # Forwarded on EVERY exit path, including the fallback handoff: the
+            # independent boundary contract (Spark) asserts the turn's real tokens reach
+            # the session compressor after a supersede.  Whether the handoff has already
+            # swapped that compressor is still an open review question (Claude).
             self._forward_compressor_progress()
             # Unregister on every exit path (normal restore AND superseded
             # skip), and only when this scope holds the registration.
