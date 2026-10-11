@@ -302,8 +302,6 @@ class _RuntimeOverrideScope:
         self.agent = agent
         self.overrides = overrides
         self._snapshot: dict[str, Any] = {}
-        self._client_kwargs_snapshot: Optional[dict[str, Any]] = None
-        self._transport_cache_snapshot: Optional[dict[str, Any]] = None
         # The ephemeral override must not become the session's recorded route:
         # mark the turn as a temporary route for usage attribution.
         self._turn_route_task_snapshot: Any = None
@@ -344,19 +342,12 @@ class _RuntimeOverrideScope:
             self._snapshot["request_overrides"] = dict(
                 self._snapshot["request_overrides"]
             )
-        # _client_kwargs feeds the per-request OpenAI-wire client.  Snapshot a
-        # shallow copy so in-place mutation is reversible.
-        ck = getattr(agent, "_client_kwargs", None)
-        if isinstance(ck, dict):
-            self._client_kwargs_snapshot = dict(ck)
-            self._snapshot["_client_kwargs"] = ck
-        # Transport cache: snapshot the content so exit can restore the
-        # pre-override cache instead of leaving an override-mode transport in
-        # the agent's per-mode cache.
-        _tc = getattr(agent, "_transport_cache", self._MISSING)
-        if isinstance(_tc, dict):
-            self._transport_cache_snapshot = dict(_tc)
-            self._snapshot["_transport_cache"] = _tc
+        # A model-only scope owns neither `_client_kwargs` nor `_transport_cache`:
+        # the model-owned projection never writes them, while credential rotation
+        # (`_swap_credential`, which clears the transport cache on a route change)
+        # legitimately does.  Rolling their content back on exit would resurrect the
+        # failed credential / a dead transport and leave `api_key` and the wire dict
+        # disagreeing, so both are deliberately left to their owner.
 
         # Temporary per-turn route: keeps `sessions.model` on the session route
         # while the override model's tokens still land in session_model_usage.
@@ -528,28 +519,6 @@ class _RuntimeOverrideScope:
                     self._restore_failed = True
                     logger.warning(
                         "runtime_override: could not restore %s", name, exc_info=True
-                    )
-            if self._client_kwargs_snapshot is not None:
-                ck = getattr(agent, "_client_kwargs", None)
-                if isinstance(ck, dict):
-                    ck.clear()
-                    ck.update(self._client_kwargs_snapshot)
-                else:
-                    self._restore_failed = True
-                    logger.warning(
-                        "runtime_override: _client_kwargs is no longer a dict; the "
-                        "pre-override client state could not be restored"
-                    )
-            if self._transport_cache_snapshot is not None:
-                tc = getattr(agent, "_transport_cache", None)
-                if isinstance(tc, dict):
-                    tc.clear()
-                    tc.update(self._transport_cache_snapshot)
-                else:
-                    self._restore_failed = True
-                    logger.warning(
-                        "runtime_override: _transport_cache is no longer a dict; the "
-                        "pre-override transport cache could not be restored"
                     )
         finally:
             # The temporary route marker is dropped on EVERY exit path, including the

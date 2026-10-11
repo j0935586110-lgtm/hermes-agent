@@ -816,8 +816,11 @@ class TestReviewRoundTwoFailurePaths:
             agent_arg.request_overrides = {"service_tier": "override"}
             agent_arg.runtime_capabilities = {"native_compaction": True}
             agent_arg._cached_system_prompt = "override-system-prompt"
-            agent_arg._client_kwargs["service_tier"] = "override"
-            agent_arg._transport_cache["chat_completions"] = "override-transport"
+            # `_client_kwargs` / `_transport_cache` are NOT model-owned: the projection
+            # never writes them (they belong to credential rotation / the transport
+            # cache), so they are not part of this rollback contract — the scope must
+            # leave them exactly as their owner had them (see the G3 contract test
+            # tests/agent/test_runtime_override_credential_restore.py).
             raise RuntimeError("projection boom")
 
         monkeypatch.setattr(
