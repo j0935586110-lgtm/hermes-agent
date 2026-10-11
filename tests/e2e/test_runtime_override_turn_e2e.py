@@ -409,23 +409,36 @@ def test_turn_e2e_fallback_supersede_restores_turn_route_task(monkeypatch, tmp_p
             f"FALLBACK LEAK: agent._turn_route_task was not restored; remaining value: {getattr(agent, '_turn_route_task', None)!r}"
         )
 
+        def _usage_snapshot():
+            with sqlite3.connect(db.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                return {
+                    (r["model"], r["task"]): r["api_call_count"]
+                    for r in conn.execute(
+                        "SELECT model, task, api_call_count FROM session_model_usage WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchall()
+                }
+
+        before_turn2 = _usage_snapshot()
+
         # Execute Turn 2 (plain turn without override)
         res2 = agent.run_conversation("turn 2 ordinary work")
         assert "ok" in (res2.get("final_response") or "")
         db.flush_token_counts()
 
-        # Check Turn 2 attribution in session_model_usage
-        with sqlite3.connect(db.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT model, task, api_call_count FROM session_model_usage WHERE session_id = ?",
-                (session_id,),
-            ).fetchall()
-
-        # Turn 2 used the active route with empty task (not contaminated by 'runtime_override')
-        normal_turn2_rows = [r for r in rows if r["task"] == ""]
-        assert len(normal_turn2_rows) >= 1, (
-            f"Expected usage rows with task='' for ordinary turns, found only: {[dict(r) for r in rows]}"
+        # Turn 2 must be attributed to the ACTIVE (fallback) route with an ordinary, empty
+        # task.  Asserting the turn-2 delta -- not merely "some row with task=''" -- is the
+        # point: turn 1's own fallback row could satisfy the weaker form.
+        after_turn2 = _usage_snapshot()
+        delta = {k: after_turn2.get(k, 0) - before_turn2.get(k, 0) for k in after_turn2}
+        assert delta.get((FALLBACK_MODEL, ""), 0) >= 1, (
+            "turn 2 was not attributed to the active route with an empty task; delta="
+            f"{ {f'{m}|{tk}': v for (m, tk), v in delta.items()} }"
+        )
+        assert not any(v > 0 for (m, tk), v in delta.items() if tk == "runtime_override"), (
+            "turn 2 leaked into the runtime_override route; delta="
+            f"{ {f'{m}|{tk}': v for (m, tk), v in delta.items()} }"
         )
     finally:
         handle.dispose()
