@@ -265,6 +265,9 @@ class _RuntimeOverrideScope:
 
     _ATTRS = ("model",)
     _MISSING = object()
+    # Per-turn route marker used for usage attribution while an ephemeral
+    # model override is live (see agent/turn_usage.py).
+    _TURN_ROUTE_TASK = "runtime_override"
     # Route-owned derived state the wire path reads and the route refresh
     # (``_refresh_derived_route_state``) rewrites for the new model.
     # Snapshot/restore the set unconditionally so untouched fields are no-ops
@@ -301,6 +304,10 @@ class _RuntimeOverrideScope:
         self._snapshot: dict[str, Any] = {}
         self._client_kwargs_snapshot: Optional[dict[str, Any]] = None
         self._transport_cache_snapshot: Optional[dict[str, Any]] = None
+        # The ephemeral override must not become the session's recorded route:
+        # mark the turn as a temporary route for usage attribution.
+        self._turn_route_task_snapshot: Any = None
+        self._turn_route_task_set = False
         # Projection writes are suppressed only for its own execution context.
         # Unlike compensation-on-exit, this has no DB snapshot or lost-update window.
         self._superseded = False
@@ -350,6 +357,14 @@ class _RuntimeOverrideScope:
         if isinstance(_tc, dict):
             self._transport_cache_snapshot = dict(_tc)
             self._snapshot["_transport_cache"] = _tc
+
+        # Temporary per-turn route: keeps `sessions.model` on the session route
+        # while the override model's tokens still land in session_model_usage.
+        # An existing route task (e.g. voice_chat) owns the marker and is left alone.
+        if not getattr(agent, "_turn_route_task", ""):
+            self._turn_route_task_snapshot = getattr(agent, "_turn_route_task", "")
+            agent._turn_route_task = self._TURN_ROUTE_TASK
+            self._turn_route_task_set = True
 
         # ── Activation phase ───────────────────────────────────────────
         # Activation failure skips automatic exit, so roll back the in-memory
@@ -415,6 +430,19 @@ class _RuntimeOverrideScope:
             self._parent_scope = agent._active_runtime_override_scope
             self._parent_scope._children.append(self)
         return self
+
+    def _restore_turn_route_task(self) -> None:
+        """Drop the temporary route marker so later turns are attributed normally."""
+        if not self._turn_route_task_set:
+            return
+        self._turn_route_task_set = False
+        try:
+            setattr(self.agent, "_turn_route_task", self._turn_route_task_snapshot or "")
+        except Exception:  # health: allow BLE001 -- restore must not mask the turn's outcome
+            self._restore_failed = True
+            logger.warning(
+                "runtime_override: could not restore _turn_route_task", exc_info=True
+            )
 
     def _abort(self) -> None:
         """Recover the in-memory route after a failed model projection.
@@ -524,6 +552,10 @@ class _RuntimeOverrideScope:
                         "pre-override transport cache could not be restored"
                     )
         finally:
+            # The temporary route marker is dropped on EVERY exit path, including the
+            # fallback handoff (`_superseded`) where the route itself is left to the
+            # fallback: a leaked marker would mis-attribute every later turn.
+            self._restore_turn_route_task()
             # Unregister on every exit path (normal restore AND superseded
             # skip), and only when this scope holds the registration.
             if self._parent_scope is not None:
