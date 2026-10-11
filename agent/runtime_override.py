@@ -495,8 +495,6 @@ class _RuntimeOverrideScope:
                 return
             self._ended = True
             for name, value in self._snapshot.items():
-                if name in ("_client_kwargs", "_transport_cache"):
-                    continue  # restored from the snapshots below
                 if value is self._MISSING:
                     # Some intentionally minimal agents never had this attr and
                     # projection didn't manufacture it.  Absence is already

@@ -9,7 +9,10 @@ per-request client was rebuilt from the stale dict and reused the failed credent
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from agent.runtime_override import apply_runtime_override
+from run_agent import AIAgent
 from tests.agent.test_runtime_override import (
     _OVERRIDE_MODEL,
     _SESSION_MODEL,
@@ -69,3 +72,42 @@ def test_transport_cache_cleared_by_rotation_stays_cleared(monkeypatch):
     assert agent._transport_cache == {}, (
         "the scope resurrected transports bound to the failed route"
     )
+
+
+def test_real_swap_credential_inside_the_scope_persists(monkeypatch):
+    """Drive the real credential-swap path (`_swap_credential`) instead of assigning
+    attributes, so the lifecycle bookkeeping it performs is covered too."""
+    monkeypatch.setattr("hermes_cli.anon_auth.route_can_serve_model", lambda *a, **k: True)
+    agent = AIAgent(
+        api_key="old-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai",
+        api_mode="chat_completions",
+        model="session-model",
+        session_id="s-swap",
+        platform="cli",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        save_trajectories=False,
+        enabled_toolsets=["file"],
+    )
+    try:
+        agent._client_kwargs = {"api_key": "old-key", "base_url": agent.base_url}
+
+        with apply_runtime_override(agent, {"model": "override-model"}):
+            entry = SimpleNamespace(
+                id="cred-2",
+                runtime_api_key="rotated-key",
+                runtime_base_url="https://api.openai.com/v1",
+            )
+            assert agent._swap_credential(entry) is True
+            assert agent.api_key == "rotated-key"
+
+        assert agent.model == "session-model"
+        assert agent.api_key == "rotated-key"
+        assert agent._client_kwargs.get("api_key") == "rotated-key", (
+            "the scope rolled the wire credential back to the failed key"
+        )
+    finally:
+        agent.close()
