@@ -208,11 +208,19 @@ def _project_override_model_state(agent: Any, overrides: Dict[str, str]) -> None
     try:
         from agent.agent_runtime_helpers import _apply_model_owned_state
 
-        _apply_model_owned_state(
-            agent,
-            str(overrides.get("model") or getattr(agent, "model", "") or ""),
-            snapshot=None,  # the scope owns rollback; no provider-switch snapshot
-        )
+        # Model-only projection uses the canonical update_model() reset logic,
+        # but those resets are ephemeral.  Suppress writes only in the current
+        # execution context and only for this scope-owned compressor.  Unlike
+        # temporarily clearing _session_db, another thread never sees broken
+        # session binding or loses permission to persist a real session event.
+        from agent.ephemeral_model_projection import suppress_ephemeral_projection_writes
+
+        with suppress_ephemeral_projection_writes(agent.context_compressor):
+            _apply_model_owned_state(
+                agent,
+                str(overrides.get("model") or getattr(agent, "model", "") or ""),
+                snapshot=None,  # the scope owns in-memory route rollback
+            )
         agent._cached_system_prompt = None
         # The cached system prompt's context-file caps are scaled by the model's
         # context window (build_system_prompt_parts reads
@@ -231,159 +239,6 @@ def _project_override_model_state(agent: Any, overrides: Dict[str, str]) -> None
             exc_info=True,
         )
         raise _ModelProjectionFailed("model-owned state projection failed") from _moe_exc
-
-
-#: Sentinel meaning "the durable key/row did not exist".  Kept distinct from
-#: ``None`` (a real stored NULL) so an exact restore re-creates absence.
-_ABSENT = object()
-
-
-def _snapshot_durable_protection(
-    compressor: Any,
-) -> tuple[Optional[Dict[str, Any]], bool]:
-    """Capture the durable compression-protection rows a model projection clears.
-
-    The canonical model-owned projection (``_apply_model_owned_state`` ->
-    ``ContextCompressor.update_model``) clears the per-session fallback streak,
-    failure cooldown, ineffective-strike count and proactive-prune runway as part
-    of a REAL model switch.  A runtime_override reuses that projection but is
-    ephemeral, so the scope rolls those durable clears back exactly on exit.
-    Returns ``(None, True)`` when the compressor has no bound session row (nothing
-    durable to roll back).
-
-    Returns ``(snapshot, complete)``: ``complete`` is False when any getter
-    failed.  A partial snapshot cannot restore what it never read, so the caller
-    must treat an incomplete snapshot as "this override cannot be established"
-    and fail open — never let the destructive clears run behind it.
-    """
-    db = getattr(compressor, "_session_db", None)
-    session_id = getattr(compressor, "_session_id", "") or ""
-    if db is None or not session_id:
-        return None, True
-    snapshot: Dict[str, Any] = {}
-    complete = True
-    for name, getter_name in (
-        ("fallback_streak", "get_compression_fallback_streak"),
-        ("ineffective_count", "get_compression_ineffective_count"),
-    ):
-        getter = getattr(db, getter_name, None)
-        if callable(getter):
-            try:
-                snapshot[name] = getter(session_id)
-            except Exception:  # noqa: BLE001
-                complete = False
-                logger.warning(
-                    "runtime_override: %s snapshot failed", getter_name, exc_info=True
-                )
-    getter = getattr(db, "get_compression_failure_cooldown_row", None)
-    if callable(getter):
-        try:
-            snapshot["cooldown_row"] = getter(session_id)
-        except Exception:  # noqa: BLE001
-            complete = False
-            logger.warning(
-                "runtime_override: cooldown snapshot failed", exc_info=True
-            )
-    getter = getattr(db, "get_session_model_config_value", None)
-    if callable(getter):
-        try:
-            from agent.context_compressor import PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY
-
-            snapshot["prune_rearm"] = getter(
-                session_id, PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, _ABSENT
-            )
-        except Exception:  # noqa: BLE001
-            complete = False
-            logger.warning(
-                "runtime_override: prune-rearm snapshot failed", exc_info=True
-            )
-    return snapshot, complete
-
-
-def _restore_durable_protection(
-    compressor: Any, snapshot: Optional[Dict[str, Any]]
-) -> bool:
-    """Best-effort exact rollback of the projection's durable clears.
-
-    Called on every non-superseded scope exit, including the exception path, so no
-    DB row stays cleared permanently.  A superseded scope skips it: the fallback
-    chain owns the route and its own ``update_model`` writes must stand.
-
-    Returns True when every row covered by ``snapshot`` was written back.  False
-    means a required setter failed, so the caller must treat the rollback as
-    incomplete rather than report a finished recovery (see ``_abort``).
-    """
-    if not snapshot:
-        return True
-    db = getattr(compressor, "_session_db", None)
-    session_id = getattr(compressor, "_session_id", "") or ""
-    if db is None or not session_id:
-        return True
-
-    ok = True
-
-    def _write(method: str, *args: Any) -> None:
-        nonlocal ok
-        setter = getattr(db, method, None)
-        if callable(setter):
-            try:
-                setter(session_id, *args)
-            except Exception:  # noqa: BLE001
-                ok = False
-                logger.warning(
-                    "runtime_override: %s restore failed", method, exc_info=True
-                )
-
-    if "fallback_streak" in snapshot:
-        _write("set_compression_fallback_streak", snapshot["fallback_streak"])
-    if "ineffective_count" in snapshot:
-        _write("set_compression_ineffective_count", snapshot["ineffective_count"])
-    if "cooldown_row" in snapshot:
-        restorer = getattr(db, "restore_compression_failure_cooldown_row", None)
-        if callable(restorer):
-            try:
-                restorer(session_id, snapshot["cooldown_row"])
-            except Exception:  # noqa: BLE001
-                ok = False
-                logger.warning(
-                    "runtime_override: cooldown restore failed", exc_info=True
-                )
-    if "prune_rearm" in snapshot:
-        try:
-            from agent.context_compressor import PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY
-
-            value = snapshot["prune_rearm"]
-            _write(
-                "patch_session_model_config",
-                {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None if value is _ABSENT else value},
-            )
-        except Exception:  # noqa: BLE001
-            ok = False
-            logger.warning(
-                "runtime_override: prune-rearm restore failed", exc_info=True
-            )
-    return ok
-
-
-def _durable_protection_changed(
-    compressor: Any, after: Optional[Dict[str, Any]]
-) -> bool:
-    """True when a newer durable write landed after ``after`` was captured.
-
-    The scope captures the durable state right after its own projection; a
-    nested/concurrent override, a real compression, or a fallback can then write
-    legitimate newer values.  Restoring the pre-override snapshot over those
-    would lose them, so the rollback is skipped in that case (only a snapshot
-    that is still current is restored).  Compares only the keys captured in BOTH
-    reads, so a getter that starts failing can never by itself suppress the
-    rollback — absence of evidence is not evidence of a newer write.
-    """
-    if after is None:
-        return False
-    current, _complete = _snapshot_durable_protection(compressor)
-    if not current:
-        return False
-    return any(current.get(key, value) != value for key, value in after.items())
 
 
 class _RuntimeOverrideScope:
@@ -446,14 +301,8 @@ class _RuntimeOverrideScope:
         self._snapshot: Dict[str, Any] = {}
         self._client_kwargs_snapshot: Optional[Dict[str, Any]] = None
         self._transport_cache_snapshot: Optional[Dict[str, Any]] = None
-        # Durable compression-protection rows the model projection clears; held
-        # on the pre-override compressor and rolled back exactly on exit.
-        self._session_compressor: Any = None
-        self._compressor_durable_snapshot: Optional[Dict[str, Any]] = None
-        # Durable state right after this scope's own projection: the rollback is
-        # skipped when a newer write (nested/concurrent override, real
-        # compression, fallback) changed it, so the snapshot cannot clobber it.
-        self._compressor_durable_after: Optional[Dict[str, Any]] = None
+        # Projection writes are suppressed only for its own execution context.
+        # Unlike compensation-on-exit, this has no DB snapshot or lost-update window.
         self._superseded = False
         # Set once a restore ran (a failed projection aborts inside __enter__),
         # so the real __exit__ cannot restore a second time.
@@ -503,9 +352,8 @@ class _RuntimeOverrideScope:
             self._snapshot["_transport_cache"] = _tc
 
         # ── Activation phase ───────────────────────────────────────────
-        # A raise here would skip ``__exit__`` entirely and leave the durable
-        # rows the projection just cleared cleared, so roll the scope back
-        # (best-effort) before the original exception propagates.
+        # Activation failure skips automatic exit, so roll back the in-memory
+        # route explicitly.  Temporary model projection never clears DB rows.
         try:
             for name in self._ATTRS:
                 if name in ov:
@@ -524,30 +372,7 @@ class _RuntimeOverrideScope:
                     ov[name] = val
                     setattr(agent, name, ov[name])
             if _ROUTE_KEYS.intersection(ov):
-                # The canonical projection clears durable per-session compression
-                # protection as part of a real model switch; snapshot those rows from
-                # the still-bound session compressor BEFORE the projection so the
-                # ephemeral override can write them back exactly on exit (see
-                # ``_restore_durable_protection``).
-                self._session_compressor = getattr(agent, "context_compressor", None)
-                (
-                    self._compressor_durable_snapshot,
-                    _durable_complete,
-                ) = _snapshot_durable_protection(self._session_compressor)
-                if not _durable_complete:
-                    # A partial snapshot cannot be rolled back exactly, and the
-                    # projection erases exactly those rows: refuse the override
-                    # instead of erasing protection this scope cannot restore.
-                    raise _ModelProjectionFailed(
-                        "durable protection snapshot is incomplete"
-                    )
                 _refresh_derived_route_state(agent, ov)
-                # Fingerprint the post-projection durable state so exit can tell
-                # our own clears apart from a newer legitimate write.
-                _after, _complete_after = _snapshot_durable_protection(
-                    self._session_compressor
-                )
-                self._compressor_durable_after = _after
         except _ModelProjectionFailed:
             # Fail open to the configured route: the override is NOT applied, so
             # the request runs on the route the agent already had — never on a
@@ -592,23 +417,11 @@ class _RuntimeOverrideScope:
         return self
 
     def _abort(self) -> None:
-        """The one recovery path for an override that must not stand.
+        """Recover the in-memory route after a failed model projection.
 
-        Both projection failures (P1-A: the projection raised part-way; P1-B: the
-        durable snapshot could not be read, so the destructive clears must not
-        run) raise ``_ModelProjectionFailed`` and land here, so there is exactly
-        one rollback implementation — ``__exit__``'s snapshot restore — and one
-        set of recovery semantics:
-
-        * rollback completed -> fall open to the configured route; the caller's
-          ``with`` body runs on the route the agent already had;
-        * rollback incomplete -> raise, because issuing the request against a
-          partially restored route is the mixed-model state this scope exists to
-          prevent.  A failed turn is recoverable; a silently mixed route is not.
-
-        ``_ended`` makes the real ``__exit__`` a no-op so the restore cannot run
-        twice, and ``agent._runtime_override`` is cleared so no retry reads the
-        override as applied.
+        The projection suppresses temporary durable writes; no DB compensation
+        is needed. Complete rollback safely falls open to the configured route.
+        Failed in-memory rollback blocks the request and clears the override.
         """
         self.agent._runtime_override = {}
         try:
@@ -666,8 +479,11 @@ class _RuntimeOverrideScope:
                 if name in ("_client_kwargs", "_transport_cache"):
                     continue  # restored from the snapshots below
                 if value is self._MISSING:
-                    # Attribute did not exist before the override — don't
-                    # fabricate it (tests build bare agents via __new__).
+                    # Some intentionally minimal agents never had this attr and
+                    # projection didn't manufacture it.  Absence is already
+                    # restored; trying delattr on it is not a rollback failure.
+                    if not hasattr(agent, name):
+                        continue
                     try:
                         delattr(agent, name)
                     except Exception:  # noqa: BLE001
@@ -707,28 +523,6 @@ class _RuntimeOverrideScope:
                         "runtime_override: _transport_cache is no longer a dict; the "
                         "pre-override transport cache could not be restored"
                     )
-            # The projection's durable compression-protection clears are rolled
-            # back exactly, so a temporary model switch leaves the session's
-            # persisted protection rows byte-identical (P1).  Skip the rollback
-            # when a newer write landed after our own projection (nested or
-            # concurrent override, real compression, fallback): restoring the
-            # pre-override snapshot over it would lose that legitimate write.
-            if _durable_protection_changed(
-                self._session_compressor, self._compressor_durable_after
-            ):
-                logger.warning(
-                    "runtime_override: skipping durable protection rollback for "
-                    "session %r: a newer write landed after the override projection",
-                    getattr(self._session_compressor, "_session_id", "") or "",
-                )
-                return
-            if not _restore_durable_protection(
-                self._session_compressor, self._compressor_durable_snapshot
-            ):
-                # A required durable setter failed: the rollback is incomplete, so
-                # a caller that failed the override must not report a finished
-                # recovery (see _abort).
-                self._restore_failed = True
         finally:
             # Unregister on every exit path (normal restore AND superseded
             # skip), and only when this scope holds the registration.
@@ -741,6 +535,14 @@ class _RuntimeOverrideScope:
                     )
             if getattr(agent, "_active_runtime_override_scope", None) is self:
                 agent._active_runtime_override_scope = None
+        if self._restore_failed:
+            agent._runtime_override = {}
+            if exc_type is None:
+                raise _ModelProjectionFailed(
+                    "runtime override route restore incomplete; refusing to report success"
+                )
+            # Preserve the original exception; it already fails this attempt.
+            logger.error("runtime override route restore incomplete during failed turn")
 
 
 def apply_runtime_override(agent: Any, overrides: Dict[str, str]) -> "_RuntimeOverrideScope":

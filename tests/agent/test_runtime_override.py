@@ -556,20 +556,17 @@ class TestDurableProtectionRestore:
             dict(db.model_config),
         )
 
-    def test_override_restores_durable_protection_exactly(self, monkeypatch):
+    def test_override_keeps_durable_protection_unchanged(self, monkeypatch):
         agent, db, session_cc = self._agent_with_recording_db(monkeypatch)
         baseline = self._durable_state(db)
 
         with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
-            # The canonical projection clears the durable protection rows
-            # mid-scope — this is the leak the override must undo.
-            assert db.fallback_streak == 0
-            assert db.ineffective_count == 0
-            assert db.cooldown_until is None
-            assert db.cooldown_error is None
-            assert PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY not in db.model_config
+            # Model-only projection never modifies the real persisted row.
+            assert self._durable_state(db) == baseline
+            assert agent.context_compressor._session_db is db
+            assert agent.context_compressor._session_id == "S1"
 
-        # Scope exit restored every durable value byte-for-byte.
+        # Scope exit needs no compensating DB writes.
         assert self._durable_state(db) == baseline
         # The pre-override compressor (and its in-memory protection state) is back.
         assert agent.context_compressor is session_cc
@@ -611,9 +608,8 @@ class TestDurableProtectionRestore:
 
     # ── R1/R2: operator-visible failures, rollback when __enter__ raises ──
 
-    def test_enter_projection_failure_still_restores_durable(self, monkeypatch):
-        # R2: a raise inside __enter__ AFTER the snapshot must not leave the
-        # projection's durable clears behind (__exit__ never runs on its own).
+    def test_enter_projection_failure_never_writes_durable(self, monkeypatch):
+        # Failure after projection must not affect persisted DB state.
         import agent.runtime_override as ro_module
 
         agent, db, _session_cc = self._agent_with_recording_db(monkeypatch)
@@ -632,9 +628,8 @@ class TestDurableProtectionRestore:
         assert self._durable_state(db) == baseline
         assert agent.context_compressor._fallback_compression_streak == 5
 
-    def test_snapshot_failure_is_logged_as_warning(self, monkeypatch, caplog):
-        # R1: a failed durable getter must be operator-visible (WARNING), not a
-        # silent debug line that leaves the session in the cleared state.
+    def test_failed_durable_getter_not_needed_for_projection(self, monkeypatch, caplog):
+        # No snapshot/getter is required for a non-destructive projection.
         import logging
 
         agent, db, _session_cc = self._agent_with_recording_db(monkeypatch)
@@ -647,15 +642,11 @@ class TestDurableProtectionRestore:
             with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
                 pass
 
-        assert any(
-            r.levelno == logging.WARNING and "snapshot failed" in r.getMessage()
-            for r in caplog.records
-        )
+        assert not any("snapshot failed" in r.getMessage() for r in caplog.records)
+        assert db.fallback_streak == 5
 
-    def test_restore_failure_is_logged_as_warning(self, monkeypatch, caplog):
-        # R1: the other half of the same contract — a failed durable setter on
-        # the rollback is operator-visible too, so a rolled-back-but-not-really
-        # session is never silent.
+    def test_failed_durable_setter_not_needed_on_scope_exit(self, monkeypatch, caplog):
+        # No compensating write is required on normal scope exit.
         import logging
 
         agent, db, _session_cc = self._agent_with_recording_db(monkeypatch)
@@ -668,10 +659,8 @@ class TestDurableProtectionRestore:
             with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
                 pass
 
-        assert any(
-            r.levelno == logging.WARNING and "restore failed" in r.getMessage()
-            for r in caplog.records
-        )
+        assert not any("restore failed" in r.getMessage() for r in caplog.records)
+        assert db.fallback_streak == 5
 
     # ── R3: absent pre-state is restored as ABSENCE, not null/0 ────────────
 
@@ -687,7 +676,7 @@ class TestDurableProtectionRestore:
         with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
             assert db.get_compression_failure_cooldown_row("S1")["session_exists"] is False
 
-        assert "restore_compression_failure_cooldown_row" in db.names()
+        assert "restore_compression_failure_cooldown_row" not in db.names()
         assert db.get_compression_failure_cooldown_row("S1")["session_exists"] is False
         assert self._durable_state(db) == baseline
 
@@ -709,15 +698,10 @@ class TestDurableProtectionRestore:
         ) == "ABSENT"
         assert db.model_config == {}
         assert self._durable_state(db) == baseline
-        # The rollback issued its own delete for the absent key, on top of the
-        # projection's no-op clear — so absence is re-created, never a 0/NULL
-        # key.  (Counting the calls distinguishes the rollback from the
-        # projection; the last patch must be the delete.)
-        restore_patches = [
-            args[1] for name, args in db.calls if name == "patch_session_model_config"
-        ]
-        assert len(restore_patches) > len(patches_mid_scope)
-        assert restore_patches[-1] == {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None}
+        # No compensating patch is issued, including the NULL/delete sentinel.
+        assert not patches_mid_scope
+        assert not [args for name, args in db.calls
+                    if name == "patch_session_model_config"]
 
     # ── R4: a newer legitimate write must survive nested rollbacks ─────────
 
@@ -886,12 +870,10 @@ class TestReviewRoundTwoFailurePaths:
         # The override is still cleared, so no retry reads it as applied.
         assert agent._runtime_override == {}
 
-    def test_incomplete_durable_rollback_refuses_to_issue_the_request(
+    def test_failed_projection_needs_no_durable_setter_for_rollback(
         self, monkeypatch
     ):
-        # Spark review risk 4: a required durable setter failing during the
-        # rollback must count as an INCOMPLETE rollback — the scope may not report
-        # a finished recovery while session protection rows are still cleared.
+        # In-memory projection failure never needs DB compensation.
         agent, db, _session_cc = self._agent_with_recording_db(monkeypatch)
 
         def _boom_model(agent_arg, new_model, snapshot=None, **kwargs):
@@ -906,16 +888,17 @@ class TestReviewRoundTwoFailurePaths:
 
         monkeypatch.setattr(db, "set_compression_fallback_streak", _boom_setter)
 
-        with pytest.raises(RuntimeError, match="partially restored route"):
-            with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
-                pytest.fail("the body must not run after an incomplete rollback")
+        # A failed projection never wrote to the database; missing setters
+        # cannot make its in-memory rollback unsafe.
+        with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
+            assert agent.model == "orig-model"
 
         assert agent._runtime_override == {}
 
     # ── P1-B: an incomplete durable snapshot must not be followed by the
     #          destructive clears it cannot roll back ─────────────────────────
 
-    def test_incomplete_durable_snapshot_aborts_before_erasing_protection(
+    def test_broken_cooldown_getter_does_not_erase_protection(
         self, monkeypatch, caplog
     ):
         import logging
@@ -926,8 +909,7 @@ class TestReviewRoundTwoFailurePaths:
         def _boom(session_id):
             raise RuntimeError("db down")
 
-        # One getter fails; the others still work.  The snapshot is therefore
-        # incomplete and the cooldown row could never be restored.
+        # Even when a getter fails, the projection does not clear DB state.
         monkeypatch.setattr(db, "get_compression_failure_cooldown_row", _boom)
 
         with caplog.at_level(logging.WARNING, logger="agent.runtime_override"):
@@ -942,7 +924,4 @@ class TestReviewRoundTwoFailurePaths:
         # the scope is unregistered.
         assert agent._runtime_override == {}
         assert getattr(agent, "_active_runtime_override_scope", None) is None
-        assert any(
-            r.levelno == logging.WARNING and "snapshot failed" in r.getMessage()
-            for r in caplog.records
-        )
+        assert not any("snapshot failed" in r.getMessage() for r in caplog.records)
