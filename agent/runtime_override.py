@@ -334,6 +334,8 @@ class _RuntimeOverrideScope:
         # against a partially restored route is exactly the mixed state this
         # scope must never produce.
         self._restore_failed = False
+        # Set when the override requested the route the agent already has.
+        self._no_op = False
         # Nesting: the registered outermost scope is this scope's parent, and a
         # supersession propagates to every live child (a child restoring its own
         # snapshot would otherwise resurrect the route the fallback replaced).
@@ -348,6 +350,17 @@ class _RuntimeOverrideScope:
         # time.  The call path in turn_api_call.py reads only the agent
         # attribute; keep that as the single point of truth.
         ov = self.overrides
+        # No-op override (the route already is what the plugin asked for): projecting and
+        # invalidating the cached system prompt here would break the byte-stability
+        # invariant for no benefit, and the turn needs neither rollback nor a marker.
+        if ov and all(
+            getattr(agent, name, self._MISSING) == value for name, value in ov.items()
+        ):
+            self._no_op = True
+            logger.debug(
+                "runtime_override: override %r matches the live route; nothing to project", ov
+            )
+            return self
         for name in self._ATTRS:
             if name in ov:
                 self._snapshot[name] = getattr(agent, name, self._MISSING)

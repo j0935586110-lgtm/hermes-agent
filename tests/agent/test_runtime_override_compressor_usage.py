@@ -43,3 +43,22 @@ def test_real_usage_recorded_during_an_override_turn_reaches_the_session_compres
     assert session_cc.last_total_tokens == 4249, (
         "the turn's real total tokens were dropped with the scoped copy"
     )
+
+
+def test_same_model_override_keeps_the_cached_system_prompt(monkeypatch):
+    """G9: a no-op override (same model) must not invalidate the frozen system prompt.
+
+    `AGENTS.md` requires the system prompt to stay byte-stable for the life of a
+    conversation; the PR body promises nothing is invalidated when the override
+    changes none of the model-owned state the turn reads.
+    """
+    _patch_model_owned_resolution(monkeypatch)
+    agent = _build_model_owned_agent(model=_SESSION_MODEL)
+    agent._cached_system_prompt = "FROZEN_SYSTEM_PROMPT_BYTES"
+
+    with apply_runtime_override(agent, {"model": _SESSION_MODEL}):  # identical model
+        inside = agent._cached_system_prompt
+
+    assert inside == "FROZEN_SYSTEM_PROMPT_BYTES", (
+        f"a no-op override invalidated the cached prompt: {inside!r}"
+    )
