@@ -93,3 +93,25 @@ def test_anti_thrash_progress_from_the_turn_is_forwarded(monkeypatch):
         agent.context_compressor._ineffective_compression_count = 2
 
     assert session_cc._ineffective_compression_count == 2
+
+
+def test_committed_compression_count_survives_the_scope(monkeypatch):
+    """A compression that committed inside the scope must be counted afterwards.
+
+    Counterexample contributed by the J1/OpenCode/agy dispatch experiment
+    (`coop-test-99053-g2-20261012/g2-count-probe.py`): the scoped copy incremented
+    `compression_count` to 1 and the session compressor still read 0.
+    """
+    _patch_model_owned_resolution(monkeypatch)
+    agent = _build_model_owned_agent(model=_SESSION_MODEL)
+    session_cc = agent.context_compressor
+    session_cc.compression_count = 0
+    session_cc._previous_summary = None
+
+    with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
+        scoped = agent.context_compressor
+        scoped.compression_count += 1  # ContextCompressor.compress() does this on success
+        scoped._previous_summary = "example valid summary"
+
+    assert session_cc.compression_count == 1, "a committed compression was lost with the copy"
+    assert session_cc._previous_summary == "example valid summary"

@@ -286,6 +286,9 @@ class _RuntimeOverrideScope:
         "_verify_compaction_cleared_threshold",
         "awaiting_real_usage_after_compression",
         "_last_compression_made_progress",
+        # Committed compressions this turn (ContextCompressor.compress() increments it
+        # on success, and later turns read it) -- found by the J1/OpenCode/agy G2 audit.
+        "compression_count",
         "_ineffective_compression_count",
         "_anti_thrash_recovery_deadline",
         "_structural_no_op_backoff_until",
