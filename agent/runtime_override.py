@@ -55,7 +55,7 @@ _STRING_KEYS = frozenset({"model"})
 _ROUTE_KEYS = frozenset({"model"})
 
 
-def validate_runtime_override(overrides: Any) -> Dict[str, str]:
+def validate_runtime_override(overrides: Any) -> dict[str, str]:
     """Type-check + filter a plugin-provided ``runtime_override`` dict.
 
     Returns only the supported, correctly-typed keys.  Unsupported keys and
@@ -68,7 +68,7 @@ def validate_runtime_override(overrides: Any) -> Dict[str, str]:
             type(overrides).__name__,
         )
         return {}
-    valid: Dict[str, str] = {}
+    valid: dict[str, str] = {}
     for key, value in overrides.items():
         if key not in RUNTIME_OVERRIDE_KEYS:
             logger.warning(
@@ -89,7 +89,7 @@ def validate_runtime_override(overrides: Any) -> Dict[str, str]:
     return valid
 
 
-def _refresh_derived_route_state(agent: Any, overrides: Dict[str, str]) -> None:
+def _refresh_derived_route_state(agent: Any, overrides: dict[str, str]) -> None:
     """Refresh provider-derived state for the overridden route.
 
     Mirrors what the canonical route switch (``switch_model`` /
@@ -110,7 +110,7 @@ def _refresh_derived_route_state(agent: Any, overrides: Dict[str, str]) -> None:
         _apply_switched_provider_request_overrides(
             agent, str(overrides.get("provider") or agent.provider)
         )
-    except Exception as _ro_exc:  # noqa: BLE001
+    except Exception as _ro_exc:
         logger.warning(
             "runtime_override: request_overrides refresh failed (%s); "
             "keeping previous value for the scope",
@@ -129,7 +129,7 @@ def _refresh_derived_route_state(agent: Any, overrides: Dict[str, str]) -> None:
                 == "openai-codex"
             ),
         )
-    except Exception as _cap_exc:  # noqa: BLE001
+    except Exception as _cap_exc:
         logger.warning(
             "runtime_override: runtime_capabilities refresh failed (%s); "
             "keeping previous value for the scope",
@@ -168,7 +168,7 @@ class _ModelProjectionFailed(RuntimeError):
     """
 
 
-def _project_override_model_state(agent: Any, overrides: Dict[str, str]) -> None:
+def _project_override_model_state(agent: Any, overrides: dict[str, str]) -> None:
     """Point the model-owned derived state at the overridden model (P1-1).
 
     Reuses the canonical model-owned projection from ``switch_model``
@@ -196,7 +196,7 @@ def _project_override_model_state(agent: Any, overrides: Dict[str, str]) -> None
         return
     try:
         agent.context_compressor = _isolated_context_compressor(_cc)
-    except Exception as _iso_exc:  # noqa: BLE001
+    except Exception as _iso_exc:
         # Never project onto the session compressor in place, and never stand on
         # a half-applied route: fail open to the configured route.
         logger.warning(
@@ -227,7 +227,7 @@ def _project_override_model_state(agent: Any, overrides: Dict[str, str]) -> None
         # context_compressor.context_length). Invalidate so the next build
         # re-scales them — mirrors switch_model's `_cached_system_prompt = None`.
         # Snapshot/restore via _DERIVED_ATTRS makes this a no-leak transaction.
-    except Exception as _moe_exc:  # noqa: BLE001
+    except Exception as _moe_exc:
         # The projection may have partially mutated the copy AND the agent's
         # model-owned attributes: go back to the session compressor and let the
         # scope roll the whole transaction back (fail open to the configured
@@ -295,12 +295,12 @@ class _RuntimeOverrideScope:
         "_cached_system_prompt",
     )
 
-    def __init__(self, agent: Any, overrides: Dict[str, str]) -> None:
+    def __init__(self, agent: Any, overrides: dict[str, str]) -> None:
         self.agent = agent
         self.overrides = overrides
-        self._snapshot: Dict[str, Any] = {}
-        self._client_kwargs_snapshot: Optional[Dict[str, Any]] = None
-        self._transport_cache_snapshot: Optional[Dict[str, Any]] = None
+        self._snapshot: dict[str, Any] = {}
+        self._client_kwargs_snapshot: Optional[dict[str, Any]] = None
+        self._transport_cache_snapshot: Optional[dict[str, Any]] = None
         # Projection writes are suppressed only for its own execution context.
         # Unlike compensation-on-exit, this has no DB snapshot or lost-update window.
         self._superseded = False
@@ -315,10 +315,10 @@ class _RuntimeOverrideScope:
         # Nesting: the registered outermost scope is this scope's parent, and a
         # supersession propagates to every live child (a child restoring its own
         # snapshot would otherwise resurrect the route the fallback replaced).
-        self._parent_scope: Optional["_RuntimeOverrideScope"] = None
-        self._children: list["_RuntimeOverrideScope"] = []
+        self._parent_scope: Optional[_RuntimeOverrideScope] = None
+        self._children: list[_RuntimeOverrideScope] = []
 
-    def __enter__(self) -> "_RuntimeOverrideScope":
+    def __enter__(self) -> _RuntimeOverrideScope:
         agent = self.agent
         # ── Snapshot phase ─────────────────────────────────────────────
         # NOTE: agent._runtime_override is the canonical source.
@@ -391,7 +391,7 @@ class _RuntimeOverrideScope:
             )
             try:
                 self.__exit__(*sys.exc_info())
-            except Exception:  # noqa: BLE001 — rollback must not mask the cause
+            except Exception:
                 logger.warning(
                     "runtime_override: rollback after activation failure failed",
                     exc_info=True,
@@ -426,7 +426,7 @@ class _RuntimeOverrideScope:
         self.agent._runtime_override = {}
         try:
             self.__exit__(None, None, None)
-        except Exception:  # noqa: BLE001 — rollback must not mask the cause
+        except Exception:
             self._restore_failed = True
             logger.warning(
                 "runtime_override: rollback after a failed override failed",
@@ -457,7 +457,7 @@ class _RuntimeOverrideScope:
         for child in list(self._children):
             child.supersede()
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         agent = self.agent
         try:
             if self._superseded:
@@ -486,7 +486,7 @@ class _RuntimeOverrideScope:
                         continue
                     try:
                         delattr(agent, name)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         self._restore_failed = True
                         logger.warning(
                             "runtime_override: could not remove %s during restore",
@@ -496,7 +496,7 @@ class _RuntimeOverrideScope:
                     continue
                 try:
                     setattr(agent, name, value)
-                except Exception:  # noqa: BLE001 — restore must never raise
+                except Exception:
                     self._restore_failed = True
                     logger.warning(
                         "runtime_override: could not restore %s", name, exc_info=True
@@ -545,7 +545,7 @@ class _RuntimeOverrideScope:
             logger.error("runtime override route restore incomplete during failed turn")
 
 
-def apply_runtime_override(agent: Any, overrides: Dict[str, str]) -> "_RuntimeOverrideScope":
+def apply_runtime_override(agent: Any, overrides: dict[str, str]) -> _RuntimeOverrideScope:
     """Return a context manager that applies ``overrides`` to ``agent``."""
     return _RuntimeOverrideScope(agent, overrides)
 
