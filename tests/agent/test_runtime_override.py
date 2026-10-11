@@ -183,27 +183,26 @@ class TestApply:
             assert agent._active_runtime_override_scope is not None
         assert getattr(agent, "_active_runtime_override_scope", None) is None
 
-    def test_nested_scope_outer_wins_registration(self):
-        # Scope 2 (wire-time safety net) is created inside Scope 1; it must
-        # not steal the registration, or the fallback handoff would find the
-        # inner scope after it already exited and miss superseding Scope 1.
+    def test_second_concurrent_scope_is_refused(self):
+        # At most one override scope may be live per agent: a second one would restore
+        # its own snapshot over the first one's work.  It is refused loudly, before
+        # anything is snapshotted -- a silent no-op would let the caller believe the
+        # override had been applied.
         from agent.runtime_override import consume_runtime_override
 
         agent = _FakeAgent()
         with apply_runtime_override(agent, {"model": "override-model"}):
             outer = agent._active_runtime_override_scope
-            with apply_runtime_override(agent, {"model": "inner-model"}):
-                # Inner scope did not steal the registration.
-                assert agent._active_runtime_override_scope is outer
-            # Inner scope exiting did not clear the outer registration either.
+            with pytest.raises(RuntimeError, match="nested runtime-override scopes"):
+                with apply_runtime_override(agent, {"model": "inner-model"}):
+                    pass
+            # The refusal left the live scope untouched, registered and in force.
             assert agent._active_runtime_override_scope is outer
+            assert agent.model == "override-model"
             agent.model = "fallback-model"
             consume_runtime_override(agent)
-        assert agent.model == "fallback-model"  # outer scope was superseded
+        assert agent.model == "fallback-model"
         assert getattr(agent, "_active_runtime_override_scope", None) is None
-        # The nested chain is unlinked on exit, so nothing keeps the inner scope
-        # (or the outer one) reachable after the turn.
-        assert outer._children == []
 
     def test_consume_runtime_override_clears_the_turn_override(self):
         from agent.runtime_override import consume_runtime_override
@@ -705,14 +704,13 @@ class TestDurableProtectionRestore:
 
     # ── R4: a newer legitimate write must survive nested rollbacks ─────────
 
-    def test_nested_override_does_not_clobber_newer_durable_write(self, monkeypatch):
-        # A legitimate durable write made while a nested override is open must
-        # survive BOTH exits: neither rollback may resurrect the pre-override 5.
+    def test_newer_durable_write_survives_the_scope_exit(self, monkeypatch):
+        # A legitimate durable write made while an override is open must survive the
+        # rollback: restoring the pre-override value would resurrect a stale streak.
         agent, db, _session_cc = self._agent_with_recording_db(monkeypatch)
 
         with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
-            with apply_runtime_override(agent, {"model": _FALLBACK_MODEL}):
-                db.set_compression_fallback_streak("S1", 7)
+            db.set_compression_fallback_streak("S1", 7)
 
         assert db.fallback_streak == 7
 
@@ -734,19 +732,15 @@ class TestReviewRoundTwoFailurePaths:
     # ── P2-A: a fallback that supersedes the outer scope must survive an open
     #          inner scope's exit ────────────────────────────────────────────
 
-    def test_fallback_supersedes_every_open_scope(self):
-        # consume_runtime_override() marks the REGISTERED (outermost) scope
-        # superseded.  If an inner scope is still open, its exit restores its own
-        # snapshot — which still describes the override route — and clobbers the
-        # fallback identity the handoff just established.
+    def test_fallback_supersedes_the_open_scope(self):
+        # consume_runtime_override() marks the registered scope superseded so its exit
+        # does not restore a snapshot that still describes the override route.
         from agent.runtime_override import consume_runtime_override
 
         agent = _FakeAgent()
         with apply_runtime_override(agent, {"model": "override-model"}):
-            with apply_runtime_override(agent, {"model": "inner-model"}):
-                agent.model = "fallback-model"  # fallback activates mid-inner-scope
-                consume_runtime_override(agent)
-            # Inner exit must not resurrect the override route.
+            agent.model = "fallback-model"  # fallback activates mid-scope
+            consume_runtime_override(agent)
             assert agent.model == "fallback-model"
             assert agent._runtime_override == {}
         assert agent.model == "fallback-model"
@@ -928,3 +922,17 @@ class TestReviewRoundTwoFailurePaths:
         assert agent._runtime_override == {}
         assert getattr(agent, "_active_runtime_override_scope", None) is None
         assert not any("snapshot failed" in r.getMessage() for r in caplog.records)
+
+
+def test_exception_inside_the_scope_still_unregisters_it(monkeypatch):
+    """A turn that raises must not leave the scope registered, or the next turn would
+    be refused as a nested scope (GPT review: exception exit still cleans up)."""
+    _patch_model_owned_resolution(monkeypatch)
+    agent = _FakeAgent()
+    with pytest.raises(RuntimeError):
+        with apply_runtime_override(agent, {"model": "override-model"}):
+            raise RuntimeError("turn blew up")
+    assert getattr(agent, "_active_runtime_override_scope", None) is None
+    # The next turn can open a scope again.
+    with apply_runtime_override(agent, {"model": "another-model"}):
+        assert agent.model == "another-model"

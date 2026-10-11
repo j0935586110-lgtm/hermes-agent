@@ -260,6 +260,10 @@ def _project_override_model_state(agent: Any, overrides: dict[str, str]) -> None
         raise _ModelProjectionFailed("model-owned state projection failed") from _moe_exc
 
 
+# Concurrency contract for every scope below: one scope per agent and per turn, and at
+# most one live at a time (a second concurrent scope is refused loudly).  Two threads
+# sharing one AIAgent while a scope is open is unsupported -- each thread owns its agent,
+# which is how the turn loop, the gateway and delegation already use it.
 class _RuntimeOverrideScope:
     """Context manager that temporarily applies an override to ``agent``.
 
@@ -388,14 +392,21 @@ class _RuntimeOverrideScope:
         self._restore_failed = False
         # Set when the override requested the route the agent already has.
         self._no_op = False
-        # Nesting: the registered outermost scope is this scope's parent, and a
-        # supersession propagates to every live child (a child restoring its own
-        # snapshot would otherwise resurrect the route the fallback replaced).
-        self._parent_scope: Optional[_RuntimeOverrideScope] = None
-        self._children: list[_RuntimeOverrideScope] = []
 
     def __enter__(self) -> _RuntimeOverrideScope:
         agent = self.agent
+        # One scope per agent at a time.  A second concurrent scope would restore its own
+        # snapshot over whatever the first one did, so it is a programming error in the
+        # core (a plugin returns a dict; it cannot open a scope itself).  Refused loudly
+        # before anything is snapshotted or projected -- a silent no-op would let the
+        # caller believe the override had been applied.
+        if getattr(agent, "_active_runtime_override_scope", None) is not None:
+            logger.warning(
+                "runtime_override: a runtime-override scope is already active on this agent"
+            )
+            raise RuntimeError(
+                "runtime_override: nested runtime-override scopes are not supported"
+            )
         # ── Snapshot phase ─────────────────────────────────────────────
         # NOTE: agent._runtime_override is the canonical source.
         # TurnContext.runtime_override is derived from it at construction
@@ -502,20 +513,9 @@ class _RuntimeOverrideScope:
 
         # Register as the agent's active scope so the fallback handoff
         # (consume_runtime_override) can find and supersede this scope.
-        # First-registered-wins: a nested scope (middleware/retry re-entry)
-        # must not steal the registration from the outermost attempt scope —
-        # the fallback sites all run outside it, so superseding the outermost
-        # scope is always correct.  An inner scope therefore registers only
-        # when no scope is registered, and unregisters only when it holds the
-        # registration.
-        if getattr(agent, "_active_runtime_override_scope", None) is None:
-            agent._active_runtime_override_scope = self
-        else:
-            # Nested scope (middleware/retry re-entry): remember the parent so a
-            # fallback handoff supersedes this scope too — a superseded parent
-            # must not leave a live child free to restore the override route.
-            self._parent_scope = agent._active_runtime_override_scope
-            self._parent_scope._children.append(self)
+        # Registered so `consume_runtime_override` (the fallback handoff) can find and
+        # supersede this scope; unregistered on every exit path below.
+        agent._active_runtime_override_scope = self
         return self
 
     def _forward_compressor_progress(self) -> None:
@@ -576,15 +576,11 @@ class _RuntimeOverrideScope:
         the failed override.  Called by ``consume_runtime_override`` from the
         ``_try_activate_fallback`` success sites.
 
-        Propagates to every live nested scope: the fallback sites all run
-        outside the attempt scopes, so an inner scope still open at that moment
-        would otherwise restore its own snapshot — the override route — over the
-        fallback identity on its way out.
+        There is at most one live scope per agent (a second one is refused), so no
+        propagation is needed.
         """
         self._superseded = True
         self.agent._runtime_override = {}
-        for child in list(self._children):
-            child.supersede()
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         agent = self.agent
@@ -646,15 +642,7 @@ class _RuntimeOverrideScope:
             # `agent.context_compressor`, so a fallback swap cannot orphan the target
             # (review question raised by Claude, refuted against the source).
             self._forward_compressor_progress()
-            # Unregister on every exit path (normal restore AND superseded
-            # skip), and only when this scope holds the registration.
-            if self._parent_scope is not None:
-                try:
-                    self._parent_scope._children.remove(self)
-                except ValueError:
-                    logger.debug(
-                        "runtime_override: nested scope was not registered with its parent"
-                    )
+            # Unregister on every exit path (normal restore AND superseded skip).
             if getattr(agent, "_active_runtime_override_scope", None) is self:
                 agent._active_runtime_override_scope = None
         if self._restore_failed:
