@@ -936,3 +936,42 @@ def test_exception_inside_the_scope_still_unregisters_it(monkeypatch):
     # The next turn can open a scope again.
     with apply_runtime_override(agent, {"model": "another-model"}):
         assert agent.model == "another-model"
+
+
+def test_failed_projection_restores_the_turn_route_task(monkeypatch):
+    """GPT second-opinion P1: `_turn_route_task` is borrowed before the projection, so
+    every failure path must give it back (abort included)."""
+    _patch_model_owned_resolution(monkeypatch)
+
+    def _boom(agent_arg, new_model, snapshot=None, **kwargs):
+        raise RuntimeError("projection boom")
+
+    monkeypatch.setattr(
+        "agent.agent_runtime_helpers._apply_model_owned_state", _boom
+    )
+    agent = _build_model_owned_agent()
+    assert getattr(agent, "_turn_route_task", "") == ""
+
+    with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
+        # Falls open to the configured route; the marker must not survive.
+        assert getattr(agent, "_turn_route_task", "") == ""
+
+    assert getattr(agent, "_turn_route_task", "") == ""
+    assert getattr(agent, "_active_runtime_override_scope", None) is None
+
+
+def test_no_op_scope_does_not_break_the_fallback_handoff(monkeypatch):
+    """GPT second-opinion P2: a no-op scope returns before registering itself; the
+    fallback handoff must still work (it must not depend on that registration)."""
+    from agent.runtime_override import consume_runtime_override
+
+    _patch_model_owned_resolution(monkeypatch)
+    agent = _build_model_owned_agent(model=_SESSION_MODEL)
+    agent.model = _SESSION_MODEL
+
+    with apply_runtime_override(agent, {"model": _SESSION_MODEL}):  # identical model
+        agent.model = "fallback-model"
+        consume_runtime_override(agent)  # must not raise with nothing registered
+        assert agent._runtime_override == {}
+
+    assert agent.model == "fallback-model"
