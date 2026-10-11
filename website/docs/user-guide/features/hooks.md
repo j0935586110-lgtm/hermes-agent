@@ -730,8 +730,11 @@ return {
 ```
 
 - **Model-only** — `model` is the only supported key. `provider`, `api_mode`, `api_key`, and `base_url` are intentionally unsupported: credentials never flow through the hook return, and the endpoint/wire resolve only from the provider's existing settings, so a plugin cannot redirect the session to another network destination or wire.
-- **Ephemeral and turn-scoped** — the override is re-resolved every turn and restored when the turn ends. It never mutates the session's persistent model identity and is never persisted to the session database.
+- **Ephemeral and turn-scoped** — the override is re-resolved every turn and restored when the turn ends. It never mutates the session's persistent model identity and is never persisted to the session database (a turn's tokens are attributed per model in `session_model_usage` instead).
 - **Applied before the first LLM call** — the override is authoritative through request construction, middleware, and wire dispatch, re-projecting the model-derived state (prompt-cache policy, context length, reasoning config) exactly like a normal model switch.
+- **Free when it changes nothing** — an override that names the model already live is a pass-through: nothing is re-projected and the cached system prompt is not invalidated, so the prompt prefix stays byte-stable.
+- **Not validated** — the model name is passed through exactly as given, and naming it correctly is the plugin's responsibility. The `/model` validator is deliberately not used here: it probes providers over the network (uncached, seconds of latency), which must not sit on a turn's critical path, and it reports an offline or unloaded local endpoint as unacceptable. A wrong name fails like a wrong name anywhere else.
+- **`codex_app_server` turns are not affected** — that path returns before the override scope opens, so the hook observes the session route there.
 - **`system_prompt` is never overridable** — it is runtime-owned and its cache prefix stays byte-stable; a model switch stays inside the existing provider route.
 
 Unsupported keys are logged with a one-line warning and ignored (never an error). A model switch stays inside the existing provider route and never touches credentials or the endpoint — installing a plugin grants it this power, so install only plugins you trust.
