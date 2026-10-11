@@ -73,6 +73,7 @@ def test_scope_exit_without_a_response_does_not_touch_session_counters(monkeypat
     session_cc.last_prompt_tokens = 777
     session_cc.last_total_tokens = 888
     session_cc._ineffective_compression_count = 3
+    session_cc._last_compression_savings_pct = 12.5
 
     with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
         pass  # no response, no compaction
@@ -80,6 +81,7 @@ def test_scope_exit_without_a_response_does_not_touch_session_counters(monkeypat
     assert session_cc.last_prompt_tokens == 777
     assert session_cc.last_total_tokens == 888
     assert session_cc._ineffective_compression_count == 3
+    assert session_cc._last_compression_savings_pct == 12.5  # untouched field stays put
 
 
 def test_anti_thrash_progress_from_the_turn_is_forwarded(monkeypatch):
@@ -133,3 +135,24 @@ def test_compaction_outcome_state_from_the_turn_is_forwarded(monkeypatch):
 
     assert session_cc._last_compression_savings_pct == 42.5
     assert session_cc._last_summary_fallback_used is True
+
+
+def test_no_op_check_does_not_invoke_a_descriptor(monkeypatch):
+    """Deciding "no-op" must read live values without running a property getter
+    (third-party review: a getter with side effects would execute on every turn)."""
+    _patch_model_owned_resolution(monkeypatch)
+    agent = _build_model_owned_agent(model=_SESSION_MODEL)
+    calls = {"n": 0}
+
+    class _Probe:
+        def __get__(self, obj, objtype=None):
+            calls["n"] += 1
+            return "probe"
+
+    type(agent).probe_attr = _Probe()
+    try:
+        with apply_runtime_override(agent, {"model": _SESSION_MODEL}):
+            pass
+        assert calls["n"] == 0, f"the no-op check invoked a descriptor {calls['n']} times"
+    finally:
+        del type(agent).probe_attr

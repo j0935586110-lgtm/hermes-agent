@@ -9,6 +9,8 @@ per-request client was rebuilt from the stale dict and reused the failed credent
 
 from __future__ import annotations
 
+import pytest
+
 from types import SimpleNamespace
 
 from agent.runtime_override import apply_runtime_override
@@ -109,5 +111,53 @@ def test_real_swap_credential_inside_the_scope_persists(monkeypatch):
         assert agent._client_kwargs.get("api_key") == "rotated-key", (
             "the scope rolled the wire credential back to the failed key"
         )
+    finally:
+        agent.close()
+
+
+def test_rotation_survives_an_exception_inside_the_scope(monkeypatch):
+    """A turn that raises after rotating credentials must not roll the rotation back
+    (third-party review: opencode/nemotron-3-super negative cases)."""
+    _patch_model_owned_resolution(monkeypatch)
+    agent = _build_model_owned_agent(model=_SESSION_MODEL)
+    agent.api_key = "old-key"
+    agent._client_kwargs = {"api_key": "old-key"}
+
+    with pytest.raises(RuntimeError):
+        with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
+            agent.api_key = "rotated-key"
+            agent._client_kwargs["api_key"] = "rotated-key"
+            raise RuntimeError("turn blew up after the rotation")
+
+    assert agent.api_key == "rotated-key"
+    assert agent._client_kwargs["api_key"] == "rotated-key"
+
+
+def test_refused_swap_changes_nothing(monkeypatch):
+    """`_swap_credential` refuses an entry whose route cannot serve the model; a refused
+    swap must leave the live credentials exactly as they were."""
+    monkeypatch.setattr("hermes_cli.anon_auth.route_can_serve_model", lambda *a, **k: False)
+    agent = AIAgent(
+        api_key="old-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai",
+        api_mode="chat_completions",
+        model="session-model",
+        session_id="s-refused",
+        platform="cli",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        save_trajectories=False,
+        enabled_toolsets=["file"],
+    )
+    try:
+        agent._client_kwargs = {"api_key": "old-key"}
+        entry = SimpleNamespace(id="cred-x", runtime_api_key="rotated-key",
+                                runtime_base_url="https://api.openai.com/v1")
+        with apply_runtime_override(agent, {"model": "override-model"}):
+            assert agent._swap_credential(entry) is False
+        assert agent.api_key == "old-key"
+        assert agent._client_kwargs.get("api_key") == "old-key"
     finally:
         agent.close()

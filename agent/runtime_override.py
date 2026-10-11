@@ -386,9 +386,11 @@ class _RuntimeOverrideScope:
         # No-op override (the route already is what the plugin asked for): projecting and
         # invalidating the cached system prompt here would break the byte-stability
         # invariant for no benefit, and the turn needs neither rollback nor a marker.
-        if ov and all(
-            getattr(agent, name, self._MISSING) == value for name, value in ov.items()
-        ):
+        # Read the live values through __dict__: a descriptor/property getter must not
+        # run (and possibly do I/O) just to decide whether this override is a no-op
+        # (third-party review: opencode/nemotron-3-ultra).
+        _live = getattr(agent, "__dict__", {})
+        if ov and all(_live.get(name, self._MISSING) == value for name, value in ov.items()):
             self._no_op = True
             logger.debug(
                 "runtime_override: override %r matches the live route; nothing to project", ov
