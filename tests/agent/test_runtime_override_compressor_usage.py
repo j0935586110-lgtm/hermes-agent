@@ -62,3 +62,34 @@ def test_same_model_override_keeps_the_cached_system_prompt(monkeypatch):
     assert inside == "FROZEN_SYSTEM_PROMPT_BYTES", (
         f"a no-op override invalidated the cached prompt: {inside!r}"
     )
+
+
+def test_scope_exit_without_a_response_does_not_touch_session_counters(monkeypatch):
+    """Three-way forwarding: a scope that produced no usage/compaction progress must
+    leave every session counter exactly as it was (no zeroing, no clobbering)."""
+    _patch_model_owned_resolution(monkeypatch)
+    agent = _build_model_owned_agent(model=_SESSION_MODEL)
+    session_cc = agent.context_compressor
+    session_cc.last_prompt_tokens = 777
+    session_cc.last_total_tokens = 888
+    session_cc._ineffective_compression_count = 3
+
+    with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
+        pass  # no response, no compaction
+
+    assert session_cc.last_prompt_tokens == 777
+    assert session_cc.last_total_tokens == 888
+    assert session_cc._ineffective_compression_count == 3
+
+
+def test_anti_thrash_progress_from_the_turn_is_forwarded(monkeypatch):
+    """Progress the turn really made -- including anti-thrash bookkeeping -- is kept."""
+    _patch_model_owned_resolution(monkeypatch)
+    agent = _build_model_owned_agent(model=_SESSION_MODEL)
+    session_cc = agent.context_compressor
+    session_cc._ineffective_compression_count = 0
+
+    with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
+        agent.context_compressor._ineffective_compression_count = 2
+
+    assert session_cc._ineffective_compression_count == 2

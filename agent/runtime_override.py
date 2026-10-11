@@ -274,13 +274,26 @@ class _RuntimeOverrideScope:
     # happened this turn, so they are handed back to the session compressor on exit
     # instead of being dropped with the copy.
     _COMPRESSOR_PROGRESS_FIELDS = (
+        # Real usage read from the provider this turn (units are the override model's
+        # tokenizer; the session's calibration stays its own).
         "last_prompt_tokens",
         "last_completion_tokens",
         "last_total_tokens",
         "last_real_prompt_tokens",
+        # Compaction bookkeeping produced this turn: verdicts, anti-thrash state and
+        # the carried summary. `_provider_omits_usage` is deliberately NOT forwarded:
+        # it is knowledge about the upstream, not progress made by this turn.
         "_verify_compaction_cleared_threshold",
         "awaiting_real_usage_after_compression",
         "_last_compression_made_progress",
+        "_ineffective_compression_count",
+        "_anti_thrash_recovery_deadline",
+        "_structural_no_op_backoff_until",
+        "_fallback_probe_at",
+        "_prellm_skip_count",
+        "_previous_summary",
+        "_summary_has_user_turn",
+        "_last_summary_error",
     )
     # Route-owned derived state the wire path reads and the route refresh
     # (``_refresh_derived_route_state``) rewrites for the new model.
@@ -323,6 +336,7 @@ class _RuntimeOverrideScope:
         # The session compressor and the scoped copy, for progress forwarding.
         self._session_compressor: Any = None
         self._scoped_compressor: Any = None
+        self._scoped_compressor_baseline: dict[str, Any] = {}
         # Projection writes are suppressed only for its own execution context.
         # Unlike compensation-on-exit, this has no DB snapshot or lost-update window.
         self._superseded = False
@@ -414,6 +428,13 @@ class _RuntimeOverrideScope:
                 if _session_cc is not None and _scoped_cc is not None and _scoped_cc is not _session_cc:
                     self._session_compressor = _session_cc
                     self._scoped_compressor = _scoped_cc
+                    # Baseline for the three-way compare below: only fields this turn
+                    # actually moved are handed back, so an untouched copy can never
+                    # zero or clobber the session's counters.
+                    self._scoped_compressor_baseline = {
+                        name: getattr(_scoped_cc, name, self._MISSING)
+                        for name in self._COMPRESSOR_PROGRESS_FIELDS
+                    }
         except _ModelProjectionFailed:
             # Fail open to the configured route: the override is NOT applied, so
             # the request runs on the route the agent already had — never on a
@@ -466,8 +487,11 @@ class _RuntimeOverrideScope:
         for name in self._COMPRESSOR_PROGRESS_FIELDS:
             if not hasattr(scoped_cc, name):
                 continue
+            value = getattr(scoped_cc, name)
+            if value == self._scoped_compressor_baseline.get(name, self._MISSING):
+                continue  # untouched by this turn: never overwrite the session's value
             try:
-                setattr(session_cc, name, getattr(scoped_cc, name))
+                setattr(session_cc, name, value)
             except Exception:  # health: allow BLE001 -- progress forwarding must not fail the turn
                 logger.debug(
                     "runtime_override: could not forward compressor progress %s", name,
