@@ -140,3 +140,20 @@ def test_null_session_model_is_not_backfilled_from_the_override(monkeypatch, tmp
     finally:
         agent.close()
         db.close()
+
+
+def test_preexisting_turn_route_task_is_preserved(monkeypatch):
+    """A route task that another feature already owns (e.g. voice_chat) must be left
+    alone by the override scope, before, during and after the turn.
+
+    Contract contributed by the Spark independent review of the G4 fix.
+    """
+    _patch_model_owned_resolution(monkeypatch)
+    agent = _build_agent()
+    agent._turn_route_task = "voice_chat"
+    try:
+        with apply_runtime_override(agent, {"model": OVERRIDE_MODEL}):
+            assert agent._turn_route_task == "voice_chat"
+        assert agent._turn_route_task == "voice_chat"
+    finally:
+        agent.close()
