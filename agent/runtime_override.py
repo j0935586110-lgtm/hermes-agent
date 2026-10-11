@@ -297,6 +297,22 @@ class _RuntimeOverrideScope:
         "_previous_summary",
         "_summary_has_user_turn",
         "_last_summary_error",
+        # The rest of the compaction/turn bookkeeping the audit script flags as progress
+        # (tools/audit_compressor_fields.py). Forwarding them is safe because the
+        # three-way compare writes a field back only when this turn actually moved it.
+        "_last_compress_aborted",
+        "_last_compress_refused_would_grow",
+        "_last_compression_savings_pct",
+        "_last_feasibility_skip",
+        "_last_summary_dropped_count",
+        "_last_summary_fallback_used",
+        "_last_summary_overload_degraded",
+        "_fallback_compression_streak",
+        "_consecutive_timeout_failures",
+        "_consecutive_truncation_failures",
+        "_summary_failure_cooldown_until",
+        "_last_cooldown_refresh_was_authoritative",
+        "_cooldown_persist_failed",
     )
     # Route-owned derived state the wire path reads and the route refresh
     # (``_refresh_derived_route_state``) rewrites for the new model.

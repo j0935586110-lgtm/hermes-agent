@@ -115,3 +115,21 @@ def test_committed_compression_count_survives_the_scope(monkeypatch):
 
     assert session_cc.compression_count == 1, "a committed compression was lost with the copy"
     assert session_cc._previous_summary == "example valid summary"
+
+
+def test_compaction_outcome_state_from_the_turn_is_forwarded(monkeypatch):
+    """A compaction that ran inside the scope leaves its outcome on the session
+    compressor (audit: tools/audit_compressor_fields.py, progress candidates)."""
+    _patch_model_owned_resolution(monkeypatch)
+    agent = _build_model_owned_agent(model=_SESSION_MODEL)
+    session_cc = agent.context_compressor
+    session_cc._last_compression_savings_pct = None
+    session_cc._last_summary_fallback_used = False
+
+    with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
+        scoped = agent.context_compressor
+        scoped._last_compression_savings_pct = 42.5
+        scoped._last_summary_fallback_used = True  # compaction outcome, turn progress
+
+    assert session_cc._last_compression_savings_pct == 42.5
+    assert session_cc._last_summary_fallback_used is True
