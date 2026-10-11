@@ -1,0 +1,45 @@
+"""Regression contract for PR #99053 finding G2: a turn's REAL usage must survive an
+ephemeral model override.
+
+The scope swaps in an isolated copy of the context compressor so the override's
+model-derived settings (context length, thresholds, calibration) cannot leak onto the
+session compressor. Real provider usage, however, is turn progress: it is recorded on
+the copy by `update_from_response` and was discarded when the session compressor was
+restored, so finalization read stale counters.
+"""
+
+from __future__ import annotations
+
+from agent.runtime_override import apply_runtime_override
+from tests.agent.test_runtime_override import (
+    _OVERRIDE_MODEL,
+    _SESSION_MODEL,
+    _build_model_owned_agent,
+    _patch_model_owned_resolution,
+)
+
+
+def test_real_usage_recorded_during_an_override_turn_reaches_the_session_compressor(
+    monkeypatch,
+):
+    _patch_model_owned_resolution(monkeypatch)
+    agent = _build_model_owned_agent(model=_SESSION_MODEL)
+    session_cc = agent.context_compressor
+    session_cc.last_prompt_tokens = 0
+    session_cc.last_completion_tokens = 0
+    session_cc.last_total_tokens = 0
+
+    with apply_runtime_override(agent, {"model": _OVERRIDE_MODEL}):
+        scoped = agent.context_compressor
+        assert scoped is not session_cc, "the scope must project onto an isolated copy"
+        # What the API loop does with the provider's real usage for this attempt.
+        scoped.update_from_response(
+            {"prompt_tokens": 4242, "completion_tokens": 7, "total_tokens": 4249}
+        )
+
+    assert session_cc.last_prompt_tokens == 4242, (
+        "the turn's real prompt tokens were dropped with the scoped copy"
+    )
+    assert session_cc.last_total_tokens == 4249, (
+        "the turn's real total tokens were dropped with the scoped copy"
+    )

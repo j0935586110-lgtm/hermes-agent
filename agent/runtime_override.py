@@ -268,6 +268,20 @@ class _RuntimeOverrideScope:
     # Per-turn route marker used for usage attribution while an ephemeral
     # model override is live (see agent/turn_usage.py).
     _TURN_ROUTE_TASK = "runtime_override"
+
+    # Turn PROGRESS recorded on the scoped compressor copy. Unlike the model-derived
+    # settings (context length, thresholds, calibration) these describe what actually
+    # happened this turn, so they are handed back to the session compressor on exit
+    # instead of being dropped with the copy.
+    _COMPRESSOR_PROGRESS_FIELDS = (
+        "last_prompt_tokens",
+        "last_completion_tokens",
+        "last_total_tokens",
+        "last_real_prompt_tokens",
+        "_verify_compaction_cleared_threshold",
+        "awaiting_real_usage_after_compression",
+        "_last_compression_made_progress",
+    )
     # Route-owned derived state the wire path reads and the route refresh
     # (``_refresh_derived_route_state``) rewrites for the new model.
     # Snapshot/restore the set unconditionally so untouched fields are no-ops
@@ -306,6 +320,9 @@ class _RuntimeOverrideScope:
         # mark the turn as a temporary route for usage attribution.
         self._turn_route_task_snapshot: Any = None
         self._turn_route_task_set = False
+        # The session compressor and the scoped copy, for progress forwarding.
+        self._session_compressor: Any = None
+        self._scoped_compressor: Any = None
         # Projection writes are suppressed only for its own execution context.
         # Unlike compensation-on-exit, this has no DB snapshot or lost-update window.
         self._superseded = False
@@ -378,7 +395,12 @@ class _RuntimeOverrideScope:
                     ov[name] = val
                     setattr(agent, name, ov[name])
             if _ROUTE_KEYS.intersection(ov):
+                _session_cc = getattr(agent, "context_compressor", None)
                 _refresh_derived_route_state(agent, ov)
+                _scoped_cc = getattr(agent, "context_compressor", None)
+                if _session_cc is not None and _scoped_cc is not None and _scoped_cc is not _session_cc:
+                    self._session_compressor = _session_cc
+                    self._scoped_compressor = _scoped_cc
         except _ModelProjectionFailed:
             # Fail open to the configured route: the override is NOT applied, so
             # the request runs on the route the agent already had — never on a
@@ -421,6 +443,23 @@ class _RuntimeOverrideScope:
             self._parent_scope = agent._active_runtime_override_scope
             self._parent_scope._children.append(self)
         return self
+
+    def _forward_compressor_progress(self) -> None:
+        """Copy this turn's real usage/compaction progress from the scoped compressor
+        copy back to the session compressor (model-derived settings stay scope-only)."""
+        session_cc, scoped_cc = self._session_compressor, self._scoped_compressor
+        if session_cc is None or scoped_cc is None or session_cc is scoped_cc:
+            return
+        for name in self._COMPRESSOR_PROGRESS_FIELDS:
+            if not hasattr(scoped_cc, name):
+                continue
+            try:
+                setattr(session_cc, name, getattr(scoped_cc, name))
+            except Exception:  # health: allow BLE001 -- progress forwarding must not fail the turn
+                logger.debug(
+                    "runtime_override: could not forward compressor progress %s", name,
+                    exc_info=True,
+                )
 
     def _restore_turn_route_task(self) -> None:
         """Drop the temporary route marker so later turns are attributed normally."""
@@ -523,6 +562,10 @@ class _RuntimeOverrideScope:
             # fallback handoff (`_superseded`) where the route itself is left to the
             # fallback: a leaked marker would mis-attribute every later turn.
             self._restore_turn_route_task()
+            # Real usage / compaction progress is turn progress, not model configuration:
+            # hand it back before the scoped copy is dropped (every exit path, including
+            # the fallback handoff -- usage is not route state).
+            self._forward_compressor_progress()
             # Unregister on every exit path (normal restore AND superseded
             # skip), and only when this scope holds the registration.
             if self._parent_scope is not None:
