@@ -390,8 +390,6 @@ class _RuntimeOverrideScope:
         # against a partially restored route is exactly the mixed state this
         # scope must never produce.
         self._restore_failed = False
-        # Set when the override requested the route the agent already has.
-        self._no_op = False
 
     def __enter__(self) -> _RuntimeOverrideScope:
         agent = self.agent
@@ -421,7 +419,6 @@ class _RuntimeOverrideScope:
         # (third-party review: opencode/nemotron-3-ultra).
         _live = getattr(agent, "__dict__", {})
         if ov and all(_live.get(name, self._MISSING) == value for name, value in ov.items()):
-            self._no_op = True
             logger.debug(
                 "runtime_override: override %r matches the live route; nothing to project", ov
             )
