@@ -390,6 +390,9 @@ class _RuntimeOverrideScope:
         # against a partially restored route is exactly the mixed state this
         # scope must never produce.
         self._restore_failed = False
+        self._system_message: str | None = None
+        self._durable_compaction_committed = False
+        self._durable_compaction_rotated = False
 
     def __enter__(self) -> _RuntimeOverrideScope:
         agent = self.agent
@@ -471,7 +474,23 @@ class _RuntimeOverrideScope:
                     setattr(agent, name, ov[name])
             if _ROUTE_KEYS.intersection(ov):
                 _session_cc = getattr(agent, "context_compressor", None)
+                # Preserve caller-supplied extra_body: only a value matching the
+                # source model's configured default is route-derived and replaceable.
+                prior_overrides = self._snapshot.get("request_overrides")
+                prior_extra = prior_overrides.get("extra_body") if isinstance(prior_overrides, dict) else None
+                source_default = None
+                if prior_extra is not None:
+                    from agent.agent_init import _custom_provider_extra_body_for_agent
+                    source_default = _custom_provider_extra_body_for_agent(
+                        provider=agent.provider, model=self._snapshot.get("model", "") or "",
+                        base_url=getattr(agent, "base_url", "") or "",
+                        custom_providers=getattr(agent, "_custom_providers", None) or [],
+                    )
                 _refresh_derived_route_state(agent, ov)
+                if prior_extra is not None and (not source_default or prior_extra != source_default):
+                    new_request_overrides = dict(getattr(agent, "request_overrides", None) or {})
+                    new_request_overrides["extra_body"] = prior_extra
+                    agent.request_overrides = new_request_overrides
                 _scoped_cc = getattr(agent, "context_compressor", None)
                 if _session_cc is not None and _scoped_cc is not None and _scoped_cc is not _session_cc:
                     self._session_compressor = _session_cc
@@ -579,6 +598,21 @@ class _RuntimeOverrideScope:
         self._superseded = True
         self.agent._runtime_override = {}
 
+    def _reconcile_committed_compaction(self) -> None:
+        """After a DB commit, rebase the restored session route onto the new state."""
+        agent = self.agent
+        if self._durable_compaction_rotated:
+            session_cc = getattr(agent, "context_compressor", None)
+            if session_cc is not None:
+                session_cc.bind_session_state(
+                    getattr(agent, "_session_db", None), getattr(agent, "session_id", "") or ""
+                )
+        prompt = agent._build_system_prompt(self._system_message)
+        agent._cached_system_prompt = prompt
+        db = getattr(agent, "_session_db", None)
+        if db is not None:
+            db.update_system_prompt(agent.session_id, prompt)
+
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         agent = self.agent
         try:
@@ -598,6 +632,8 @@ class _RuntimeOverrideScope:
                 return
             self._ended = True
             for name, value in self._snapshot.items():
+                if self._durable_compaction_committed and name == "_cached_system_prompt":
+                    continue
                 if value is self._MISSING:
                     # Some intentionally minimal agents never had this attr and
                     # projection didn't manufacture it.  Absence is already
@@ -639,9 +675,11 @@ class _RuntimeOverrideScope:
             # `agent.context_compressor`, so a fallback swap cannot orphan the target
             # (review question raised by Claude, refuted against the source).
             self._forward_compressor_progress()
-            # Unregister on every exit path (normal restore AND superseded skip).
+            # Always unregister, even if reconciliation cannot complete.
             if getattr(agent, "_active_runtime_override_scope", None) is self:
                 agent._active_runtime_override_scope = None
+            if self._durable_compaction_committed and not self._superseded:
+                self._reconcile_committed_compaction()
         if self._restore_failed:
             agent._runtime_override = {}
             if exc_type is None:
@@ -652,9 +690,29 @@ class _RuntimeOverrideScope:
             logger.error("runtime override route restore incomplete during failed turn")
 
 
-def apply_runtime_override(agent: Any, overrides: dict[str, str]) -> _RuntimeOverrideScope:
-    """Return a context manager that applies ``overrides`` to ``agent``."""
-    return _RuntimeOverrideScope(agent, overrides)
+def durable_session_model(agent: Any) -> str:
+    """Model for persisted session rows, excluding turn-scoped overrides."""
+    scope = getattr(agent, "_active_runtime_override_scope", None)
+    if scope is not None and not scope._superseded:
+        return scope._snapshot.get("model", agent.model)
+    return agent.model
+
+
+def note_durable_compaction_commit(agent: Any, split_status: str) -> None:
+    """A real DB commit crosses an override scope; ordinary rollback is invalid."""
+    scope = getattr(agent, "_active_runtime_override_scope", None)
+    if scope is not None:
+        scope._durable_compaction_committed = True
+        scope._durable_compaction_rotated = split_status == "rotated_committed"
+
+
+def apply_runtime_override(
+    agent: Any, overrides: dict[str, str], *, system_message: str | None = None,
+) -> _RuntimeOverrideScope:
+    """Return the model-only temporary route scope."""
+    scope = _RuntimeOverrideScope(agent, overrides)
+    scope._system_message = system_message
+    return scope
 
 
 def consume_runtime_override(agent: Any) -> None:
